@@ -1,8 +1,9 @@
 ﻿using System;
+using System.IO;
 using System.Net.WebSockets;
 using System.Text;
 using System.Security.Cryptography;
-
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace VideChatApp
@@ -12,14 +13,18 @@ namespace VideChatApp
         private readonly ClientWebSocket _client;
         private readonly CancellationTokenSource _cancellationTokenSource;
         private readonly Uri _uri;
+        private readonly byte[] _aesKey;
+        private readonly byte[] _aesIV;
 
         public event EventHandler<string> MessageReceived;
 
-        public WebSocketClient(Uri uri)
+        public WebSocketClient(Uri uri, byte[] aesKey, byte[] aesIV)
         {
             _client = new ClientWebSocket();
             _cancellationTokenSource = new CancellationTokenSource();
             _uri = uri;
+            _aesKey = aesKey;
+            _aesIV = aesIV;
         }
 
         public async Task ConnectAsync()
@@ -31,8 +36,15 @@ namespace VideChatApp
 
         public async Task SendMessageAsync(string message)
         {
-            var buffer = new ArraySegment<byte>(Encoding.UTF8.GetBytes(message));
-            await _client.SendAsync(buffer, WebSocketMessageType.Text, true, _cancellationTokenSource.Token);
+            try
+            {
+                byte[] encryptedMessage = EncryptMessage(message, _aesKey, _aesIV);
+                await _client.SendAsync(new ArraySegment<byte>(encryptedMessage), WebSocketMessageType.Binary, true, _cancellationTokenSource.Token);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending message: {ex.Message}");
+            }
         }
 
         private async Task ReceiveLoopAsync()
@@ -43,23 +55,57 @@ namespace VideChatApp
                 try
                 {
                     var result = await _client.ReceiveAsync(new ArraySegment<byte>(buffer), _cancellationTokenSource.Token);
-                    if (result.MessageType == WebSocketMessageType.Text)
+                    if (result.MessageType == WebSocketMessageType.Binary)
                     {
-                        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        MessageReceived?.Invoke(this, message);
+                        string decryptedMessage = DecryptMessage(buffer, _aesKey, _aesIV);
+                        MessageReceived?.Invoke(this, decryptedMessage);
                     }
-                }
-                catch (WebSocketException ex)
-                {
-                    Console.WriteLine($"WebSocketException during message reception: {ex.Message}");
-                }
-                catch (OperationCanceledException)
-                {
-                    // Connection closed gracefully
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error during message reception: {ex.Message}");
+                    Console.WriteLine($"Error receiving message: {ex.Message}");
+                }
+            }
+        }
+
+        private byte[] EncryptMessage(string message, byte[] key, byte[] iv)
+        {
+            using (var aes = new AesManaged())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Padding = PaddingMode.PKCS7;
+                aes.Mode = CipherMode.CBC;
+
+                using (var encryptor = aes.CreateEncryptor())
+                using (var memoryStream = new MemoryStream())
+                {
+                    using (var crypto = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write))
+                    {
+                        byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+                        crypto.Write(messageBytes, 0, messageBytes.Length);
+                        crypto.FlushFinalBlock();
+                        return memoryStream.ToArray();
+                    }
+                }
+            }
+        }
+
+        private string DecryptMessage(byte[] encryptedMessage, byte[] key, byte[] iv)
+        {
+            using (var aes = new AesManaged())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Padding = PaddingMode.PKCS7;
+                aes.Mode = CipherMode.CBC;
+
+                using (var decryptor = aes.CreateDecryptor())
+                using (var memoryStream = new MemoryStream(encryptedMessage))
+                using (var cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read))
+                using (var streamReader = new StreamReader(cryptoStream))
+                {
+                    return streamReader.ReadToEnd();
                 }
             }
         }
