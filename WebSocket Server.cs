@@ -1,6 +1,12 @@
 ﻿using Fleck;
-using System;
 using System.Collections.Generic;
+using System;
+using System.Net;
+using System.Net.WebSockets;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Text;
+using System.IO;
 using System.Security.Cryptography;
 
 namespace VideChatApp
@@ -9,7 +15,6 @@ namespace VideChatApp
     {
         private readonly Fleck.WebSocketServer _server;
         private readonly byte[] _encryptionKey;
-        private readonly byte[] _encryptionIV;
         private readonly List<IWebSocketConnection> _activeSockets; // Список активных сокетов
 
         public event EventHandler<string> MessageReceived;
@@ -33,24 +38,40 @@ namespace VideChatApp
                 };
                 socket.OnMessage = message =>
                 {
-                    // Расшифровать сообщение и вызвать событие MessageReceived
-                    string decryptedMessage = DecryptMessage(message);
-                    MessageReceived?.Invoke(this, decryptedMessage);
+                    try
+                    {
+                        // Расшифровать сообщение и вызвать событие MessageReceived
+                        string decryptedMessage = DecryptMessage(message);
+                        if (decryptedMessage != null)
+                        {
+                            MessageReceived?.Invoke(this, decryptedMessage);
+                        }
+                    }
+                    catch(Exception ex)
+                    {
+                        LogError("Error decrypting message", ex);
+                    }
                 };
             });
 
             _encryptionKey = GenerateRandomKey(32); // 256 бит
-            _encryptionIV = GenerateRandomKey(16);  // 128 бит
         }
 
         public void SendMessage(string message)
         {
             // Шифровать сообщение перед отправкой
-            string encryptedMessage = EncryptMessage(message);
-
-            foreach (var socket in _activeSockets)
+            try
             {
-                socket.Send(encryptedMessage);
+                string encryptedMessage = EncryptMessage(message);
+
+                foreach (var socket in _activeSockets)
+                {
+                    socket.Send(encryptedMessage);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError("Error encrypting message", ex);
             }
         }
 
@@ -60,7 +81,7 @@ namespace VideChatApp
             using (Aes aesAlg = Aes.Create())
             {
                 aesAlg.Key = _encryptionKey;
-                aesAlg.IV = _encryptionIV;
+                aesAlg.GenerateIV(); // енерация нового IV для каждого сообщения
 
                 // Создание объекта шифратора для выполнения потокового шифрования данных
                 ICryptoTransform encryptor = aesAlg.CreateEncryptor(aesAlg.Key, aesAlg.IV);
@@ -68,6 +89,8 @@ namespace VideChatApp
                 // Cоздание потока для записи зашифрованных данных
                 using (MemoryStream msEncrypt = new MemoryStream())
                 {
+                    msEncrypt.Write(aesAlg.IV, 0, aesAlg.IV.Length); // Запись IV в начало потока
+
                     using (CryptoStream csEncrypt = new CryptoStream(msEncrypt, encryptor, CryptoStreamMode.Write))
                     {
                         using (StreamWriter swEncrypt = new StreamWriter(csEncrypt))
@@ -75,9 +98,10 @@ namespace VideChatApp
                             // Записать все данные в поток
                             swEncrypt.Write(message);
                         }
-                        // Вернуть зашифрованные данные в виде массива байтов
-                        return Convert.ToBase64String(msEncrypt.ToArray());
                     }
+
+                    // Вернуть зашифрованные данные в виде массива байтов
+                    return Convert.ToBase64String(msEncrypt.ToArray());
                 }
 
             }
@@ -88,26 +112,30 @@ namespace VideChatApp
         {
             try
             {
+                byte[] fullCipher = Convert.FromBase64String(encryptedMessage);
+
                 using (Aes aesAlg = Aes.Create())
                 {
+                    byte[] iv = new byte[16];
+                    byte[] cupherText = new byte[fullCipher.Length - iv.Length];
+
+                    Array.Copy(fullCipher, iv, iv.Length);
+                    Array.Copy(fullCipher, iv.Length, cipherText, 0, cipherText.Length);
+
                     aesAlg.Key = _encryptionKey;
-                    aesAlg.IV = _encryptionIV;
+                    aesAlg.IV = iv;
 
                     // Создание объекта дешифратора для выполнения потокового дешифрования данных
                     ICryptoTransform decryptor = aesAlg.CreateDecryptor(aesAlg.Key, aesAlg.IV);
 
                     // Создание потока для чтения зашифрованных данных
-                    using (MemoryStream msDecrypt = new MemoryStream(Convert.FromBase64String(encryptedMessage)))
+                    using (MemoryStream msDecrypt = new MemoryStream(cipherText))
                     {
                         using (CryptoStream csDecrypt = new CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Read))
                         {
                             using (StreamReader srDecrypt = new StreamReader(csDecrypt))
                             {
-                                // Чтение расшифрованных данных из потока
-                                string decryptedText = srDecrypt.ReadToEnd();
-
-                                // Вернуть расшифрованные данные
-                                return decryptedText;
+                                return srDecrypt.ReadToEnd();
                             }
                         }
                     }
@@ -116,13 +144,13 @@ namespace VideChatApp
             catch (CryptographicException ex)
             {
                 // Обработка ошибок криптографии
-                Console.WriteLine("CryptographicException при дешифровании сообщения: " + ex.Message);
+                LogError("Cryptographic error while decrypting message", ex);
                 return null; // Возвращаем null в случае ошибки
             }
             catch (Exception ex)
             {
                 // Общая обработка ошибок
-                Console.WriteLine("Произошла ошибка при дешифровании сообщения: " + ex.Message);
+                LogError("General error while decrypting message", ex);
                 return null; // Возвращаем null в случае ошибки
             }
         }
@@ -135,6 +163,12 @@ namespace VideChatApp
                 rng.GetBytes(key);
             }
             return key;
+        }
+
+        private void LogError(string message, Exception ex)
+        {
+            Console.WriteLine($"{message}: {ex.Message}");
+            File.AppendAllText("errors.log", $"{DateTime.Now} - {message}: {ex} \n")
         }
     }
 }
